@@ -3,6 +3,7 @@ import shutil
 import sys
 from pathlib import Path
 
+from .gif_compressor import compress_gif
 from .image_compressor import compress_image
 from .targets import TARGETS, load_user_presets, presets_path, resolve_target_bytes
 from .video_compressor import HW_BACKENDS, EncodeError, compress_video
@@ -12,6 +13,7 @@ VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 # Output containers we can mux H.265/H.264 + AAC into. Input ext doesn't matter (.webm/.avi -> .mp4).
 VIDEO_OUT_EXTS = {".mp4", ".mov", ".m4v", ".mkv"}
 IMAGE_OUT_EXTS = {".jpg", ".jpeg"}  # the image path always emits JPEG
+GIF_OUT_EXTS = {".gif"}
 
 
 def main() -> int:
@@ -39,6 +41,10 @@ def main() -> int:
     parser.add_argument(
         "--two-pass", action="store_true",
         help="two-pass software encoding: slower per attempt, lands closer to the target in fewer attempts",
+    )
+    parser.add_argument(
+        "--gif", action="store_true",
+        help="write videos as GIFs (first 30 s, frame rate kept, width shrinks to fit); .gif inputs are always compressed as GIFs",
     )
     parser.add_argument("--list-presets", action="store_true", help="show built-in and user presets, then exit")
     args = parser.parse_args()
@@ -79,8 +85,8 @@ def main() -> int:
         for i, source in enumerate(sources, 1):
             if batch:
                 print(f"[{i}/{len(sources)}] {source}")
-            output = (out_dir / _default_name(source)) if out_dir else (Path(args.output) if args.output else None)
-            worst = max(worst, _process(source, target_bytes, output, args.force, args.hw, args.two_pass))
+            output = (out_dir / _default_name(source, args.gif)) if out_dir else (Path(args.output) if args.output else None)
+            worst = max(worst, _process(source, target_bytes, output, args.force, args.hw, args.two_pass, args.gif))
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
         return 130
@@ -99,8 +105,10 @@ def _list_presets() -> int:
     return 0
 
 
-def _kind(path: Path):
+def _kind(path: Path, gif: bool = False):
     ext = path.suffix.lower()
+    if ext == ".gif" or (gif and ext in VIDEO_EXTS):
+        return "gif", ".gif", GIF_OUT_EXTS
     if ext in IMAGE_EXTS:
         return "image", ".jpg", IMAGE_OUT_EXTS
     if ext in VIDEO_EXTS:
@@ -108,8 +116,8 @@ def _kind(path: Path):
     return None
 
 
-def _default_name(source: Path) -> str:
-    return f"{source.stem}-squeezed{_kind(source)[1]}"
+def _default_name(source: Path, gif: bool = False) -> str:
+    return f"{source.stem}-squeezed{_kind(source, gif)[1]}"
 
 
 def _collect_sources(inputs, recursive):
@@ -131,16 +139,16 @@ def _collect_sources(inputs, recursive):
 
 
 def _process(source: Path, target_bytes: int, output: Path | None, force: bool,
-             hw: str = "none", two_pass: bool = False) -> int:
+             hw: str = "none", two_pass: bool = False, gif: bool = False) -> int:
     """Compress one file. Returns 0 ok, 1 error, 2 still over target."""
-    info = _kind(source)
+    info = _kind(source, gif)
     if info is None:
         print(f"error: unsupported file type '{source.suffix.lower()}'", file=sys.stderr)
         return 1
     kind, _default_ext, allowed = info
 
     if output is None:
-        output = source.with_name(_default_name(source))
+        output = source.with_name(_default_name(source, gif))
     if output.suffix.lower() not in allowed:
         print(
             f"error: {kind} output must end in {', '.join(sorted(allowed))} (got '{output.suffix}')",
@@ -152,13 +160,16 @@ def _process(source: Path, target_bytes: int, output: Path | None, force: bool,
         return 1
 
     source_size = source.stat().st_size
-    if source_size <= target_bytes and not force:
+    converting = kind == "gif" and source.suffix.lower() != ".gif"  # video -> GIF is a format change, never a no-op
+    if source_size <= target_bytes and not force and not converting:
         print(f"{source.name} is already under target ({_human(source_size)} <= {_human(target_bytes)}); nothing to do (use --force to re-encode)")
         return 0
 
     try:
         print(f"Compressing {kind} to fit {_human(target_bytes)}...")
-        if kind == "image":
+        if kind == "gif":
+            compress_gif(str(source), target_bytes, str(output), on_progress=print)
+        elif kind == "image":
             output.parent.mkdir(parents=True, exist_ok=True)
             compress_image(str(source), target_bytes, str(output))
         else:

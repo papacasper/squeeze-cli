@@ -20,8 +20,11 @@ squeeze *.mp4 -t 25MB -o small/            # batch: several files, output into a
 squeeze ~/Videos -r -t discord-free         # a directory (add -r to descend into subfolders)
 squeeze clip.mp4 -t 10MB --two-pass        # slower, lands closer to the target
 squeeze clip.mp4 -t 10MB --hw auto         # GPU encoder (nvenc/vaapi/qsv/amf), falls back to software
+squeeze clip.mp4 --gif -t 8MB              # video -> GIF (first 30 s); a .gif input is compressed as a GIF
 squeeze --list-presets
 ```
+
+GIF output keeps the source frame rate and shrinks only the width (down to 160 px for video, 120 px for GIFs) until it fits.
 
 Batch runs continue past failures; the exit code is the worst result (0 ok, 1 error, 2 still over target). Earlier `*-squeezed` outputs are skipped when scanning a directory.
 
