@@ -155,6 +155,9 @@ def compress_video(
                 break
 
             bitrate = next_video_bitrate(bitrate, pass_bytes, target_bytes, audio_bytes)
+            if bitrate == MIN_BITRATE and ladder_index < len(HEIGHT_LADDER) - 1:
+                # Bitrate is floored, so another pass at this height would just repeat; drop a rung.
+                ladder_index += 1
 
         if best_path is None:
             raise EncodeError("Video compression failed to produce output")

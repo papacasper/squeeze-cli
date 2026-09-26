@@ -16,6 +16,17 @@ pip install -e .
 squeeze video.mp4 -t discord-free          # 20MB
 squeeze photo.jpg -t 5MB
 squeeze clip.mov -t whatsapp -o out.mp4
+squeeze *.mp4 -t 25MB -o small/            # batch: several files, output into a directory
+squeeze ~/Videos -r -t discord-free         # a directory (add -r to descend into subfolders)
+squeeze --list-presets
+```
+
+Batch runs continue past failures; the exit code is the worst result (0 ok, 1 error, 2 still over target). Earlier `*-squeezed` outputs are skipped when scanning a directory.
+
+Your own presets go in `~/.config/squeeze/presets.json` (or `$XDG_CONFIG_HOME/squeeze/`), overriding built-ins of the same name:
+
+```json
+{"tiny": "8MB", "forum": "4MB"}
 ```
 
 Presets: `discord-free` (20MB), `discord-basic` (50MB), `discord-nitro` (500MB), `email` (20MB), `text` (100MB), `whatsapp` (2GB), `telegram` (2GB). Or pass any size like `25MB`, `500KB`, `2GB`.
