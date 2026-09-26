@@ -162,3 +162,27 @@ def test_bad_presets_file(monkeypatch, tmp_path, capsys):
     Image.new("RGB", (10, 10)).save(f)
     assert run(monkeypatch, f) == 1
     assert "bad presets file" in capsys.readouterr().err
+
+
+@needs_ffmpeg
+def test_two_pass_fits_target(monkeypatch, mp4, tmp_path):
+    out = tmp_path / "tp.mp4"
+    target = 400 * 1024
+    assert run(monkeypatch, mp4, "-t", f"{target}", "--two-pass", "-o", out) == 0
+    assert out.stat().st_size <= target
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith(".squeeze-")]
+
+
+@needs_ffmpeg
+def test_hw_auto_falls_back_or_fits(monkeypatch, mp4, tmp_path):
+    out = tmp_path / "hw.mp4"
+    target = 400 * 1024
+    assert run(monkeypatch, mp4, "-t", f"{target}", "--hw", "auto", "-o", out) == 0
+    assert out.stat().st_size <= target
+
+
+@needs_ffmpeg
+def test_hw_unavailable_backend_errors(monkeypatch, mp4, tmp_path, capsys):
+    monkeypatch.setattr("squeeze_cli.video_compressor._hw_works", lambda enc: False)
+    assert run(monkeypatch, mp4, "-t", "300KB", "--hw", "qsv") == 1
+    assert "not available" in capsys.readouterr().err

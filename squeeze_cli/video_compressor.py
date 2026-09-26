@@ -1,6 +1,8 @@
 """Bitrate/resolution ladder re-encode via ffmpeg, mirroring VideoCompressor.kt."""
 
+import functools
 import json
+import os
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -15,6 +17,10 @@ MIN_AUDIO_BITRATE = 32_000
 MAX_AUDIO_BITRATE = 128_000
 AUDIO_SHARE_OF_TARGET = 0.10  # audio gets ~10% of the total budget, clamped to the range above
 TARGET_FILL = 0.95  # aim slightly under the target; the rest absorbs container overhead
+
+
+HW_BACKENDS = ("nvenc", "vaapi", "qsv", "amf")  # probed in this order for --hw auto
+VAAPI_DEVICE = "/dev/dri/renderD128"
 
 
 class EncodeError(RuntimeError):
@@ -78,11 +84,52 @@ def next_video_bitrate(bitrate: int, pass_bytes: int, target_bytes: int, audio_b
     return max(MIN_BITRATE, int(bitrate * (target_video / pass_video) * 0.85))
 
 
+def _hw_args(encoder: str) -> list[str]:
+    return ["-vaapi_device", VAAPI_DEVICE] if encoder.endswith("_vaapi") else []
+
+
+@functools.lru_cache(maxsize=None)
+def _hw_works(encoder: str) -> bool:
+    """A listed hardware encoder isn't necessarily usable (no GPU/driver), so try a tiny encode."""
+    vf = "format=nv12,hwupload" if encoder.endswith("_vaapi") else "format=yuv420p"
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error", *_hw_args(encoder),
+        "-f", "lavfi", "-i", "testsrc2=s=256x144:d=0.2:r=10",
+        "-vf", vf, "-c:v", encoder, "-f", "null", "-",
+    ]
+    try:
+        return subprocess.run(cmd, capture_output=True, timeout=20).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def pick_hw_encoder(hw: str) -> str | None:
+    """Resolve --hw (none/auto/nvenc/vaapi/qsv/amf) to a working hevc_* encoder name, or None."""
+    if hw == "none":
+        return None
+    backends = HW_BACKENDS if hw == "auto" else (hw,)
+    for backend in backends:
+        if _hw_works(f"hevc_{backend}"):
+            return f"hevc_{backend}"
+    if hw != "auto":
+        raise EncodeError(f"hardware encoder '{hw}' is not available on this machine")
+    return None
+
+
+def encoder_chain(hw: str = "none") -> list[str]:
+    """Encoders to try in order; a failing one falls through to the next."""
+    chain = ["libx265", "libx264"]
+    hw_encoder = pick_hw_encoder(hw)
+    return [hw_encoder, *chain] if hw_encoder else chain
+
+
 def compress_video(
     source_path: str,
     target_bytes: int,
     output_path: str,
     on_progress=lambda msg: None,
+    hw: str = "none",
+    two_pass: bool = False,
 ) -> str:
     info = probe(source_path)
     audio_bps = audio_bitrate_for(target_bytes, info.duration_sec, info.has_audio)
@@ -92,7 +139,9 @@ def compress_video(
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    codec = "libx265"
+    chain = encoder_chain(hw)
+    codec_index = 0
+    codec = chain[0]
     best_path: Path | None = None
     best_bytes = float("inf")
     previous_pass_bytes = float("inf")
@@ -105,25 +154,25 @@ def compress_video(
             target_height = min(HEIGHT_LADDER[ladder_index], info.height)
             pass_path = Path(tmp) / f"pass{attempt}{output.suffix}"
 
-            on_progress(
-                f"Encoding pass {attempt}/{MAX_ATTEMPTS} "
-                f"({bitrate // 1000} kbps, {target_height}p, {_codec_name(codec)})..."
-            )
-            try:
-                _encode(source_path, pass_path, bitrate, audio_bps, target_height, info.height, codec)
-            except EncodeError as first_error:
-                if codec != "libx265":
-                    if best_path is not None:
-                        break
-                    raise
-                on_progress(f"HEVC encode failed, switching to H.264 ({_first_line(first_error)})")
-                codec = "libx264"
+            while True:
+                on_progress(
+                    f"Encoding pass {attempt}/{MAX_ATTEMPTS} "
+                    f"({bitrate // 1000} kbps, {target_height}p, {_codec_name(codec)})..."
+                )
                 try:
-                    _encode(source_path, pass_path, bitrate, audio_bps, target_height, info.height, codec)
-                except EncodeError:
+                    _encode(source_path, pass_path, bitrate, audio_bps, target_height, info.height,
+                            codec, two_pass, Path(tmp) / "stats")
+                    break
+                except EncodeError as error:
                     if best_path is not None:
                         break
-                    raise
+                    if codec_index == len(chain) - 1:
+                        raise
+                    codec_index += 1
+                    codec = chain[codec_index]
+                    on_progress(f"Encoder failed, switching to {_codec_name(codec)} ({_first_line(error)})")
+            if best_path is not None and not pass_path.exists():
+                break
 
             pass_bytes = pass_path.stat().st_size if pass_path.exists() else 0
             if pass_bytes <= 0:
@@ -167,28 +216,56 @@ def compress_video(
 
 
 def _encode(source_path, pass_path: Path, bitrate: int, audio_bps: int,
-            target_height: int, original_height: int, codec: str) -> None:
-    # Explicit maps keep the first video + first audio track only. Without them, ffmpeg's
-    # default stream selection can drag in subtitle/data streams the MP4 muxer rejects.
-    cmd = [
-        "ffmpeg", "-y", "-loglevel", "error", "-i", str(source_path),
-        "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
-        "-c:v", codec, "-b:v", str(bitrate), "-pix_fmt", "yuv420p",
-    ]
-    if codec == "libx265":
-        cmd += ["-tag:v", "hvc1"]  # Apple/QuickTime and most players need this tag for HEVC-in-MP4
+            target_height: int, original_height: int, codec: str,
+            two_pass: bool = False, stats: Path | None = None) -> None:
+    hw = codec.startswith("hevc_") or codec.endswith("_vaapi")
+    vaapi = codec.endswith("_vaapi")
+    filters = []
     if target_height < original_height:
-        cmd += ["-vf", f"scale=-2:{target_height}"]
-    if audio_bps:
-        cmd += ["-c:a", "aac", "-b:a", str(audio_bps)]
-    cmd += ["-movflags", "+faststart", str(pass_path)]
+        filters.append(f"scale=-2:{target_height}")
+    if vaapi:
+        filters += ["format=nv12", "hwupload"]
 
+    def command(extra: list[str], audio: bool, out: str) -> list[str]:
+        # Explicit maps keep the first video + first audio track only. Without them, ffmpeg's
+        # default stream selection can drag in subtitle/data streams the MP4 muxer rejects.
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", *_hw_args(codec), "-i", str(source_path),
+               "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
+               "-c:v", codec, "-b:v", str(bitrate)]
+        if not vaapi:
+            cmd += ["-pix_fmt", "yuv420p"]
+        if codec == "libx265" or codec.startswith("hevc_"):
+            cmd += ["-tag:v", "hvc1"]  # Apple/QuickTime and most players need this tag for HEVC-in-MP4
+        if filters:
+            cmd += ["-vf", ",".join(filters)]
+        cmd += extra
+        if audio and audio_bps:
+            cmd += ["-c:a", "aac", "-b:a", str(audio_bps)]
+        return cmd + (["-movflags", "+faststart"] if audio else []) + [out]
+
+    if two_pass and not hw and stats is not None:
+        first, second = _two_pass_args(codec, stats)
+        _run(command(first, False, "-")[:-1] + ["-an", "-f", "null", os.devnull])
+        _run(command(second, True, str(pass_path)))
+    else:
+        _run(command([], True, str(pass_path)))
+
+
+def _two_pass_args(codec: str, stats: Path) -> tuple[list[str], list[str]]:
+    if codec == "libx265":
+        return (["-x265-params", f"pass=1:stats={stats}"], ["-x265-params", f"pass=2:stats={stats}"])
+    return (["-pass", "1", "-passlogfile", str(stats)], ["-pass", "2", "-passlogfile", str(stats)])
+
+
+def _run(cmd: list[str]) -> None:
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise EncodeError(f"ffmpeg failed: {_tail(result.stderr)}")
 
 
 def _codec_name(codec: str) -> str:
+    if codec.startswith("hevc_"):
+        return f"H.265 {codec.split('_')[1]}"
     return "H.265" if codec == "libx265" else "H.264"
 
 

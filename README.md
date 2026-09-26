@@ -18,6 +18,8 @@ squeeze photo.jpg -t 5MB
 squeeze clip.mov -t whatsapp -o out.mp4
 squeeze *.mp4 -t 25MB -o small/            # batch: several files, output into a directory
 squeeze ~/Videos -r -t discord-free         # a directory (add -r to descend into subfolders)
+squeeze clip.mp4 -t 10MB --two-pass        # slower, lands closer to the target
+squeeze clip.mp4 -t 10MB --hw auto         # GPU encoder (nvenc/vaapi/qsv/amf), falls back to software
 squeeze --list-presets
 ```
 

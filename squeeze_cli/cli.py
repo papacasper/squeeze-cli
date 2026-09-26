@@ -5,7 +5,7 @@ from pathlib import Path
 
 from .image_compressor import compress_image
 from .targets import TARGETS, load_user_presets, presets_path, resolve_target_bytes
-from .video_compressor import EncodeError, compress_video
+from .video_compressor import HW_BACKENDS, EncodeError, compress_video
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".heif"}
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
@@ -32,6 +32,14 @@ def main() -> int:
     )
     parser.add_argument("-f", "--force", action="store_true", help="re-encode even if already under target")
     parser.add_argument("-r", "--recursive", action="store_true", help="descend into subdirectories")
+    parser.add_argument(
+        "--hw", default="none", choices=["none", "auto", *HW_BACKENDS],
+        help="hardware video encoder (faster, less size-efficient): auto picks the first that works (default: none)",
+    )
+    parser.add_argument(
+        "--two-pass", action="store_true",
+        help="two-pass software encoding: slower per attempt, lands closer to the target in fewer attempts",
+    )
     parser.add_argument("--list-presets", action="store_true", help="show built-in and user presets, then exit")
     args = parser.parse_args()
 
@@ -72,7 +80,7 @@ def main() -> int:
             if batch:
                 print(f"[{i}/{len(sources)}] {source}")
             output = (out_dir / _default_name(source)) if out_dir else (Path(args.output) if args.output else None)
-            worst = max(worst, _process(source, target_bytes, output, args.force))
+            worst = max(worst, _process(source, target_bytes, output, args.force, args.hw, args.two_pass))
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
         return 130
@@ -122,7 +130,8 @@ def _collect_sources(inputs, recursive):
     return sources, missing
 
 
-def _process(source: Path, target_bytes: int, output: Path | None, force: bool) -> int:
+def _process(source: Path, target_bytes: int, output: Path | None, force: bool,
+             hw: str = "none", two_pass: bool = False) -> int:
     """Compress one file. Returns 0 ok, 1 error, 2 still over target."""
     info = _kind(source)
     if info is None:
@@ -153,7 +162,7 @@ def _process(source: Path, target_bytes: int, output: Path | None, force: bool) 
             output.parent.mkdir(parents=True, exist_ok=True)
             compress_image(str(source), target_bytes, str(output))
         else:
-            compress_video(str(source), target_bytes, str(output), on_progress=print)
+            compress_video(str(source), target_bytes, str(output), on_progress=print, hw=hw, two_pass=two_pass)
     except (EncodeError, OSError, ValueError) as e:  # PIL raises OSError on corrupt images
         print(f"error: {e}", file=sys.stderr)
         return 1
