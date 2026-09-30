@@ -6,6 +6,7 @@ from pathlib import Path
 from .gif_compressor import compress_gif
 from .image_compressor import compress_image
 from .targets import TARGETS, load_user_presets, presets_path, resolve_target_bytes
+from .policy import Floors
 from .video_compressor import HW_BACKENDS, EncodeError, compress_video
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".heif"}
@@ -46,6 +47,12 @@ def main() -> int:
         "--gif", action="store_true",
         help="write videos as GIFs (first 30 s, frame rate kept, width shrinks to fit); .gif inputs are always compressed as GIFs",
     )
+    parser.add_argument("--min-height", type=int, default=720, metavar="PX",
+                        help="never scale video below this height (default: 720)")
+    parser.add_argument("--min-fps", type=float, default=24, metavar="FPS",
+                        help="never drop video below this frame rate (default: 24)")
+    parser.add_argument("--min-audio-kbps", type=int, default=32, metavar="KBPS",
+                        help="lowest audio bitrate to step down to (default: 32)")
     parser.add_argument("--list-presets", action="store_true", help="show built-in and user presets, then exit")
     args = parser.parse_args()
 
@@ -63,6 +70,11 @@ def main() -> int:
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
+
+    if args.min_height < 144 or args.min_fps <= 0 or args.min_audio_kbps < 8:
+        print("error: --min-height/--min-fps/--min-audio-kbps out of range", file=sys.stderr)
+        return 1
+    floors = Floors(args.min_height, args.min_fps, args.min_audio_kbps * 1000)
 
     sources, missing = _collect_sources(args.inputs, args.recursive)
     for m in missing:
@@ -86,7 +98,7 @@ def main() -> int:
             if batch:
                 print(f"[{i}/{len(sources)}] {source}")
             output = (out_dir / _default_name(source, args.gif)) if out_dir else (Path(args.output) if args.output else None)
-            worst = max(worst, _process(source, target_bytes, output, args.force, args.hw, args.two_pass, args.gif))
+            worst = max(worst, _process(source, target_bytes, output, args.force, args.hw, args.two_pass, args.gif, floors))
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
         return 130
@@ -139,7 +151,7 @@ def _collect_sources(inputs, recursive):
 
 
 def _process(source: Path, target_bytes: int, output: Path | None, force: bool,
-             hw: str = "none", two_pass: bool = False, gif: bool = False) -> int:
+             hw: str = "none", two_pass: bool = False, gif: bool = False, floors: Floors = Floors()) -> int:
     """Compress one file. Returns 0 ok, 1 error, 2 still over target."""
     info = _kind(source, gif)
     if info is None:
@@ -173,7 +185,7 @@ def _process(source: Path, target_bytes: int, output: Path | None, force: bool,
             output.parent.mkdir(parents=True, exist_ok=True)
             compress_image(str(source), target_bytes, str(output))
         else:
-            compress_video(str(source), target_bytes, str(output), on_progress=print, hw=hw, two_pass=two_pass)
+            compress_video(str(source), target_bytes, str(output), on_progress=print, hw=hw, two_pass=two_pass, floors=floors)
     except (EncodeError, OSError, ValueError) as e:  # PIL raises OSError on corrupt images
         print(f"error: {e}", file=sys.stderr)
         return 1

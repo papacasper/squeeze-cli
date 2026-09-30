@@ -39,7 +39,7 @@ Presets: `discord-free` (20MB), `discord-basic` (50MB), `discord-nitro` (500MB),
 ## How it works
 
 - **Images**: JPEG quality binary search (2-95), falls back to downscaling 30% per round if quality=2 still exceeds target. Respects EXIF orientation.
-- **Video**: re-encodes via ffmpeg (`libx265`, falling back to `libx264` on failure), retrying up to 8 passes with progressively lower bitrate, and stepping resolution down a ladder (1080p → 720p → 540p → 480p → 360p → 240p) if bitrate reduction alone stops helping.
+- **Video**: re-encodes via ffmpeg (`libx265`, falling back to `libx264` on failure), retrying up to 8 passes with progressively lower bitrate. Sizing policy mirrors the Android app (`squeeze_cli/policy.py`): starts at 1080p or 720p depending on what the bitrate can support, never goes below your floors (`--min-height 720`, `--min-fps 24`, `--min-audio-kbps 32`), caps audio at 35% of the budget and steps it down (64→48→32 kbps) only when video is already at its floor, and warns up front when the target is unreachable or will look rough.
 
 Same size-target logic as the Squeeze Android app — see `squeeze_cli/video_compressor.py` and `image_compressor.py`.
 

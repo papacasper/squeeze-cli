@@ -8,15 +8,10 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-MAX_ATTEMPTS = 8
-MIN_BITRATE = 100_000  # bits/sec
-MAX_BITRATE = 20_000_000
-HEIGHT_LADDER = [1080, 720, 540, 480, 360, 240]
+from . import policy
+from .policy import MIN_BITRATE, Floors
 
-MIN_AUDIO_BITRATE = 32_000
-MAX_AUDIO_BITRATE = 128_000
-AUDIO_SHARE_OF_TARGET = 0.10  # audio gets ~10% of the total budget, clamped to the range above
-TARGET_FILL = 0.95  # aim slightly under the target; the rest absorbs container overhead
+MAX_ATTEMPTS = 8
 
 
 HW_BACKENDS = ("nvenc", "vaapi", "qsv", "amf")  # probed in this order for --hw auto
@@ -32,13 +27,16 @@ class MediaInfo:
     duration_sec: float
     height: int
     has_audio: bool
+    width: int = 0
+    fps: float = 30.0
+    audio_bps: int = 0
 
 
 def probe(source_path: str) -> MediaInfo:
     result = subprocess.run(
         [
             "ffprobe", "-v", "error", "-print_format", "json",
-            "-show_entries", "format=duration:stream=height,codec_type",
+            "-show_entries", "format=duration:stream=width,height,codec_type,r_frame_rate,bit_rate",
             source_path,
         ],
         capture_output=True, text=True,
@@ -56,32 +54,27 @@ def probe(source_path: str) -> MediaInfo:
         duration = float(data.get("format", {}).get("duration"))
     except (TypeError, ValueError):
         duration = 10.0
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    try:
+        audio_bps = int(audio.get("bit_rate")) if audio else 0
+    except (TypeError, ValueError):
+        audio_bps = policy.FALLBACK_AUDIO_BITRATE
     return MediaInfo(
         duration_sec=max(duration, 1.0),
         height=int(video["height"]),
-        has_audio=any(s.get("codec_type") == "audio" for s in streams),
+        has_audio=audio is not None,
+        width=int(video.get("width", 0)),
+        fps=_parse_fps(video.get("r_frame_rate")),
+        audio_bps=audio_bps or (policy.FALLBACK_AUDIO_BITRATE if audio else 0),
     )
 
 
-def audio_bitrate_for(target_bytes: int, duration_sec: float, has_audio: bool) -> int:
-    if not has_audio:
-        return 0
-    total_bps = target_bytes * 8 / duration_sec
-    return int(min(MAX_AUDIO_BITRATE, max(MIN_AUDIO_BITRATE, total_bps * AUDIO_SHARE_OF_TARGET)))
-
-
-def initial_video_bitrate(target_bytes: int, duration_sec: float, audio_bps: int) -> int:
-    video_bps = target_bytes * 8 * TARGET_FILL / duration_sec - audio_bps
-    return int(min(MAX_BITRATE, max(MIN_BITRATE, video_bps)))
-
-
-def next_video_bitrate(bitrate: int, pass_bytes: int, target_bytes: int, audio_bytes: float) -> int:
-    """Scale the bitrate by how far the video portion of the last pass was from its budget."""
-    if pass_bytes <= 0:
-        return max(MIN_BITRATE, int(bitrate * 0.5))
-    pass_video = max(pass_bytes - audio_bytes, pass_bytes * 0.1)
-    target_video = max(target_bytes - audio_bytes, target_bytes * 0.1)
-    return max(MIN_BITRATE, int(bitrate * (target_video / pass_video) * 0.85))
+def _parse_fps(text) -> float:
+    try:
+        num, _, den = str(text).partition("/")
+        return float(num) / float(den or 1)
+    except (ValueError, ZeroDivisionError):
+        return 30.0
 
 
 def _hw_args(encoder: str) -> list[str]:
@@ -130,11 +123,22 @@ def compress_video(
     on_progress=lambda msg: None,
     hw: str = "none",
     two_pass: bool = False,
+    floors: Floors = Floors(),
 ) -> str:
     info = probe(source_path)
-    audio_bps = audio_bitrate_for(target_bytes, info.duration_sec, info.has_audio)
+    ladder = floors.ladder()
+    audio_bps = policy.audio_bitrate(info.audio_bps, target_bytes, info.duration_sec)
     audio_bytes = audio_bps * info.duration_sec / 8
-    bitrate = initial_video_bitrate(target_bytes, info.duration_sec, audio_bps)
+    source_bytes = Path(source_path).stat().st_size
+    bitrate = policy.initial_video_bitrate(target_bytes, info.duration_sec, audio_bytes, source_bytes)
+    pixels = info.width * info.height
+    verdict = policy.assess(target_bytes, info.duration_sec, info.audio_bps, pixels, info.height,
+                            source_bytes, floors)
+    if verdict.level == "unreachable":
+        on_progress(f"Warning: can't reach this size; the smallest possible is about {verdict.min_bytes // 1024 // 1024} MB "
+                    f"at {floors.min_height}p / {floors.min_fps:g} fps. Trying anyway.")
+    elif verdict.level == "rough":
+        on_progress(f"Warning: will fit, but the video will look rough (about {verdict.video_bitrate // 1000} kbps).")
 
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -145,23 +149,28 @@ def compress_video(
     best_path: Path | None = None
     best_bytes = float("inf")
     previous_pass_bytes = float("inf")
-    ladder_index = 0
+    ladder_index = policy.starting_ladder_index(bitrate, pixels, info.height, ladder)
+    # Still starved at the chosen rung: cap the frame rate (a no-op for sources already at or below the floor).
+    cap_fps = policy.starved_at(bitrate, pixels, info.height, min(ladder[ladder_index], info.height))
 
     # Temp passes live beside the output (same filesystem, so the final move is atomic) and are
     # removed on every exit path, including Ctrl-C.
     with tempfile.TemporaryDirectory(prefix=".squeeze-", dir=output.parent) as tmp:
         for attempt in range(1, MAX_ATTEMPTS + 1):
-            target_height = min(HEIGHT_LADDER[ladder_index], info.height)
+            target_height = min(ladder[ladder_index], info.height)
+            capped = cap_fps and info.fps > floors.min_fps
+            fps_label = f", {floors.min_fps:g} fps" if capped else ""
+            audio_label = f", audio {audio_bps // 1000} kbps" if audio_bps else ""
             pass_path = Path(tmp) / f"pass{attempt}{output.suffix}"
 
             while True:
                 on_progress(
                     f"Encoding pass {attempt}/{MAX_ATTEMPTS} "
-                    f"({bitrate // 1000} kbps, {target_height}p, {_codec_name(codec)})..."
+                    f"({bitrate // 1000} kbps, {target_height}p{fps_label}{audio_label}, {_codec_name(codec)})..."
                 )
                 try:
                     _encode(source_path, pass_path, bitrate, audio_bps, target_height, info.height,
-                            codec, two_pass, Path(tmp) / "stats")
+                            codec, two_pass, Path(tmp) / "stats", floors.min_fps if capped else None)
                     break
                 except EncodeError as error:
                     if best_path is not None:
@@ -195,16 +204,25 @@ def compress_video(
             # likely already near-optimal for this resolution — escalate downscaling instead.
             if previous_pass_bytes not in (float("inf"), 0):
                 shrink_ratio = pass_bytes / previous_pass_bytes
-                if attempt > 1 and shrink_ratio > 0.9 and ladder_index < len(HEIGHT_LADDER) - 1:
+                if attempt > 1 and shrink_ratio > 0.9 and ladder_index < len(ladder) - 1:
                     ladder_index += 1
             previous_pass_bytes = pass_bytes
 
-            if bitrate <= MIN_BITRATE and ladder_index == len(HEIGHT_LADDER) - 1:
-                on_progress("Reached minimum bitrate and resolution; can't shrink further.")
-                break
+            if ladder_index == len(ladder) - 1:
+                cap_fps = True  # out of resolution to give up
+            if bitrate <= MIN_BITRATE and ladder_index == len(ladder) - 1 and (capped or info.fps <= floors.min_fps):
+                lower = policy.next_lower_audio(audio_bps, floors)
+                if lower is None:
+                    on_progress("Reached minimum bitrate, resolution, frame rate and audio; can't shrink further.")
+                    break
+                audio_bps = lower
+                audio_bytes = audio_bps * info.duration_sec / 8
+                bitrate = policy.initial_video_bitrate(target_bytes, info.duration_sec, audio_bytes, source_bytes)
+                previous_pass_bytes = float("inf")
+                continue
 
-            bitrate = next_video_bitrate(bitrate, pass_bytes, target_bytes, audio_bytes)
-            if bitrate == MIN_BITRATE and ladder_index < len(HEIGHT_LADDER) - 1:
+            bitrate = policy.next_video_bitrate(bitrate, pass_bytes, target_bytes, audio_bytes)
+            if bitrate == MIN_BITRATE and ladder_index < len(ladder) - 1:
                 # Bitrate is floored, so another pass at this height would just repeat; drop a rung.
                 ladder_index += 1
 
@@ -217,12 +235,14 @@ def compress_video(
 
 def _encode(source_path, pass_path: Path, bitrate: int, audio_bps: int,
             target_height: int, original_height: int, codec: str,
-            two_pass: bool = False, stats: Path | None = None) -> None:
+            two_pass: bool = False, stats: Path | None = None, cap_fps: float | None = None) -> None:
     hw = codec.startswith("hevc_") or codec.endswith("_vaapi")
     vaapi = codec.endswith("_vaapi")
     filters = []
     if target_height < original_height:
         filters.append(f"scale=-2:{target_height}")
+    if cap_fps:
+        filters.append(f"fps={cap_fps:g}")
     if vaapi:
         filters += ["format=nv12", "hwupload"]
 
