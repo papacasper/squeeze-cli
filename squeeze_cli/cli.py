@@ -8,6 +8,7 @@ from .image_compressor import compress_image
 from .targets import TARGETS, load_user_presets, presets_path, resolve_target_bytes
 from .policy import Floors
 from .video_compressor import HW_BACKENDS, EncodeError, compress_video
+from . import __version__
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".heif"}
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
@@ -22,6 +23,7 @@ def main() -> int:
         prog="squeeze",
         description="Compress images or videos on-device to fit a target size.",
     )
+    parser.add_argument("--version", action="version", version=f"squeeze {__version__}")
     parser.add_argument("inputs", nargs="*", metavar="input", help="image/video files or directories")
     parser.add_argument(
         "-t", "--target",
