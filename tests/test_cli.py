@@ -186,3 +186,31 @@ def test_hw_unavailable_backend_errors(monkeypatch, mp4, tmp_path, capsys):
     monkeypatch.setattr("squeeze_cli.video_compressor._hw_works", lambda enc: False)
     assert run(monkeypatch, mp4, "-t", "300KB", "--hw", "qsv") == 1
     assert "not available" in capsys.readouterr().err
+
+
+@needs_ffmpeg
+def test_same_stem_inputs_get_distinct_outputs(monkeypatch, mp4, tmp_path):
+    mov = tmp_path / "in.mov"
+    mov.write_bytes(mp4.read_bytes())
+    assert run(monkeypatch, mp4, mov, "-f", "-t", "200KB") == 0
+    assert (tmp_path / "in-squeezed.mp4").exists()
+    assert (tmp_path / "in-squeezed-2.mp4").exists()
+
+
+@needs_ffmpeg
+def test_failed_pass_leftover_is_not_used(monkeypatch, mp4, tmp_path):
+    from squeeze_cli import video_compressor as vc
+    calls = []
+
+    def fake_encode(source, pass_path, *args, **kwargs):
+        calls.append(pass_path)
+        if len(calls) == 1:
+            pass_path.write_bytes(b"x" * 400_000)  # a complete pass, over the 200 KB target
+        else:
+            pass_path.write_bytes(b"y" * 10)  # truncated output, then ffmpeg fails
+            raise vc.EncodeError("ffmpeg failed: boom")
+
+    monkeypatch.setattr(vc, "_encode", fake_encode)
+    out = tmp_path / "out.mp4"
+    vc.compress_video(str(mp4), 200 * 1024, str(out))
+    assert out.read_bytes() == b"x" * 400_000

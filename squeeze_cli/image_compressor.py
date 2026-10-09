@@ -4,12 +4,17 @@ import io
 
 from PIL import Image, ImageOps
 
+try:  # registers .heic/.heif with Pillow
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:  # pragma: no cover - pillow-heif is a declared dependency
+    pass
+
 
 def compress_image(source_path: str, target_bytes: int, output_path: str) -> str:
     image = Image.open(source_path)
     image = ImageOps.exif_transpose(image)  # respects EXIF orientation
-    if image.mode in ("RGBA", "P"):
-        image = image.convert("RGB")
+    image = _to_jpeg_mode(image)
 
     working = image
     best: bytes | None = None
@@ -38,6 +43,18 @@ def compress_image(source_path: str, target_bytes: int, output_path: str) -> str
     with open(output_path, "wb") as f:
         f.write(final_bytes)
     return output_path
+
+
+def _to_jpeg_mode(image: Image.Image) -> Image.Image:
+    """JPEG takes RGB, L or CMYK only; transparency is flattened onto white rather than dropped."""
+    if image.mode in ("RGB", "L", "CMYK"):
+        return image
+    if image.mode in ("RGBA", "LA", "PA") or (image.mode == "P" and "transparency" in image.info):
+        rgba = image.convert("RGBA")
+        background = Image.new("RGB", rgba.size, (255, 255, 255))
+        background.paste(rgba, mask=rgba.getchannel("A"))
+        return background
+    return image.convert("RGB")
 
 
 def _encode_jpeg(image: Image.Image, quality: int) -> bytes:

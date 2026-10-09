@@ -173,6 +173,7 @@ def compress_video(
                             codec, two_pass, Path(tmp) / "stats", floors.min_fps if capped else None)
                     break
                 except EncodeError as error:
+                    pass_path.unlink(missing_ok=True)  # ffmpeg can leave a truncated file behind
                     if best_path is not None:
                         break
                     if codec_index == len(chain) - 1:

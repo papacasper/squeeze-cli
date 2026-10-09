@@ -67,7 +67,8 @@ def compress_gif(source_path: str, target_bytes: int, output_path: str, on_progr
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     best_size = None
-    with tempfile.TemporaryDirectory(prefix="squeeze-gif-") as tmp:
+    # Beside the output, not in /tmp: Path.replace can't cross filesystems (tmpfs /tmp -> EXDEV).
+    with tempfile.TemporaryDirectory(prefix=".squeeze-gif-", dir=out.parent) as tmp:
         for attempt in range(1, MAX_ATTEMPTS + 1):
             on_progress(f"GIF pass {attempt}/{MAX_ATTEMPTS} ({width}px wide, {fps:g} fps)...")
             candidate = Path(tmp) / f"pass{attempt}.gif"

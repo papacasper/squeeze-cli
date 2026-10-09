@@ -50,3 +50,15 @@ def test_gif_input_is_compressed_as_gif_by_default(monkeypatch, mp4_silent, tmp_
 def test_gif_flag_rejects_non_gif_output_name(monkeypatch, mp4_silent, tmp_path, capsys):
     assert run(monkeypatch, mp4_silent, "--gif", "-o", tmp_path / "x.mp4") == 1
     assert "must end in .gif" in capsys.readouterr().err
+
+
+@needs_ffmpeg
+def test_gif_temp_files_live_beside_the_output(monkeypatch, mp4_silent, tmp_path):
+    # Passes used to be built in the system temp dir and moved, which fails across filesystems
+    # (tmpfs /tmp -> /home). With the system temp dir unusable, the GIF must still be written.
+    import tempfile
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "no-such-dir"))
+    out = tmp_path / "out" / "clip.gif"
+    assert run(monkeypatch, mp4_silent, "--gif", "-t", "2MB", "-o", out) == 0
+    assert out.exists()
+    assert [p.name for p in out.parent.iterdir()] == ["clip.gif"]

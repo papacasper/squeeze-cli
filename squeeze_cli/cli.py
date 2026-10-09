@@ -95,11 +95,17 @@ def main() -> int:
             return 1
 
     worst = 1 if missing else 0
+    taken = {s.resolve() for s in sources}  # never write over an input, or over another output from this run
     try:
         for i, source in enumerate(sources, 1):
             if batch:
                 print(f"[{i}/{len(sources)}] {source}")
-            output = (out_dir / _default_name(source, args.gif)) if out_dir else (Path(args.output) if args.output else None)
+            if args.output and not out_dir:
+                output = Path(args.output)
+            elif _kind(source, args.gif) is None:
+                output = None  # _process reports the unsupported type
+            else:
+                output = _unique((out_dir or source.parent) / _default_name(source, args.gif), taken)
             worst = max(worst, _process(source, target_bytes, output, args.force, args.hw, args.two_pass, args.gif, floors))
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
@@ -132,6 +138,16 @@ def _kind(path: Path, gif: bool = False):
 
 def _default_name(source: Path, gif: bool = False) -> str:
     return f"{source.stem}-squeezed{_kind(source, gif)[1]}"
+
+
+def _unique(path: Path, taken: set) -> Path:
+    """`path`, or `name-2.ext`, `name-3.ext`... if an input or an earlier output of this run already uses it."""
+    candidate, n = path, 2
+    while candidate.resolve() in taken:
+        candidate = path.with_name(f"{path.stem}-{n}{path.suffix}")
+        n += 1
+    taken.add(candidate.resolve())
+    return candidate
 
 
 def _collect_sources(inputs, recursive):
