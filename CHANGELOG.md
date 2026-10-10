@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.1
 - Fix: `--gif` failed with "Invalid cross-device link" when /tmp is a separate filesystem (tmpfs); GIF passes now live beside the output.
 - Fix: inputs with the same name (`clip.mp4`, `clip.mov`) wrote the same `clip-squeezed.mp4`; later ones now get `-2`, `-3`...
 - Fix: `.heic`/`.heif` images can be read (new dependency: pillow-heif).
